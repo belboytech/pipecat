@@ -9,11 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from openai import NotGiven
 from openai._types import NOT_GIVEN as OPENAI_NOT_GIVEN
+from openai.types import CompletionUsage
 
 from pipecat.adapters.llm.services.anthropic_adapter import AnthropicLLMInvocationParams
 from pipecat.adapters.llm.services.bedrock_adapter import AWSBedrockLLMInvocationParams
 from pipecat.adapters.llm.services.gemini_adapter import GeminiLLMInvocationParams
 from pipecat.adapters.llm.services.open_ai_adapter import OpenAILLMInvocationParams
+from pipecat.metrics.metrics import LLMTokenUsage, LLMUsageMetricsData
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.aws.llm import AWSBedrockLLMService
@@ -93,6 +95,43 @@ async def test_openai_run_inference_with_llm_context():
             tools=OPENAI_NOT_GIVEN,
             tool_choice=OPENAI_NOT_GIVEN,
         )
+
+
+@pytest.mark.asyncio
+async def test_openai_run_inference_reports_usage():
+    """Test run_inference reports the provider's token usage to on_inference_usage."""
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
+        service._client = AsyncMock()
+
+        mock_context = MagicMock(spec=LLMContext)
+        mock_adapter = _mock_adapter()
+        mock_adapter.get_llm_invocation_params.return_value = OpenAILLMInvocationParams(
+            messages=[], tools=OPENAI_NOT_GIVEN, tool_choice=OPENAI_NOT_GIVEN
+        )
+        service.get_llm_adapter = MagicMock(return_value=mock_adapter)
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Hello!"
+        mock_response.usage = CompletionUsage(
+            prompt_tokens=12, completion_tokens=3, total_tokens=15
+        )
+        service._client.chat.completions.create.return_value = mock_response
+
+        reported: list[LLMUsageMetricsData] = []
+
+        @service.event_handler("on_inference_usage")
+        async def on_inference_usage(service, usage: LLMUsageMetricsData):
+            reported.append(usage)
+
+        result = await service.run_inference(mock_context)
+
+        # Handlers have run by the time run_inference returns.
+        assert result == "Hello!"
+        assert [(usage.model, usage.value) for usage in reported] == [
+            ("gpt-4", LLMTokenUsage(prompt_tokens=12, completion_tokens=3, total_tokens=15))
+        ]
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,7 @@ from pipecat.frames.frames import (
     TTSMetadataFrame,
     UserTurnResponseCancelFrame,
 )
+from pipecat.metrics.metrics import LLMTokenUsage, LLMUsageMetricsData
 from pipecat.processors.aggregators.async_tool_messages import ASYNC_TOOL_INSTRUCTIONS
 from pipecat.processors.aggregators.llm_context import (
     NOT_GIVEN,
@@ -315,6 +316,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
       are excluded from this event.
     - on_function_calls_cancelled: Called after one or more async tool calls are
       cancelled.
+    - on_inference_usage: Called with the ``LLMUsageMetricsData`` of a
+      :meth:`run_inference` call, from services that report it. Its handlers run
+      before ``run_inference()`` returns. Out-of-band inference isn't in the
+      pipeline, so it reports no ``MetricsFrame``; this is how its tokens are counted.
 
     Example::
 
@@ -329,6 +334,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         @task.event_handler("on_function_calls_cancelled")
         async def on_function_calls_cancelled(service, function_calls: List[FunctionCallFromLLM]):
             logger.info(f"Cancelled {len(function_calls)} function calls")
+
+        @llm.event_handler("on_inference_usage")
+        async def on_inference_usage(service, usage: LLMUsageMetricsData):
+            logger.info(f"run_inference used {usage.value.total_tokens} tokens")
     """
 
     _settings: LLMSettings
@@ -511,6 +520,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._register_event_handler("on_function_calls_started")
         self._register_event_handler("on_function_calls_cancelled")
         self._register_event_handler("on_completion_timeout")
+        self._register_event_handler("on_inference_usage", sync=True)
 
     @classmethod
     def _resolve_adapter_class(cls) -> type[BaseLLMAdapter]:
@@ -605,6 +615,18 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             The LLM's response as a string, or None if no response is generated.
         """
         raise NotImplementedError(f"run_inference() not supported by {self.__class__.__name__}")
+
+    async def _report_inference_usage(self, tokens: LLMTokenUsage):
+        """Report the tokens a :meth:`run_inference` call used to ``on_inference_usage``.
+
+        Args:
+            tokens: The token usage the provider reported for the call.
+        """
+        model = self._settings.model
+        usage = LLMUsageMetricsData(
+            processor=self.name, model=model if isinstance(model, str) else None, value=tokens
+        )
+        await self._call_event_handler("on_inference_usage", usage)
 
     def _check_response_schema(
         self, response_schema: dict[str, Any] | None
