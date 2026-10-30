@@ -1833,6 +1833,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._paired_user_aggregator = _paired_user_aggregator
 
         self._function_calls_in_progress: dict[str, FunctionCallInProgressFrame | None] = {}
+        # Cancellations that arrived before their call's FunctionCallInProgressFrame,
+        # held until that frame arrives so the call can be settled in the context.
+        self._function_calls_cancelled_early: dict[str, FunctionCallCancelFrame] = {}
         self._function_calls_image_results: dict[str, UserImageRawFrame] = {}
         # Markers seen on LLMMarkerFrames, so a service configured with markers
         # other than the defaults still gets them stripped from transcripts.
@@ -2231,6 +2234,10 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         self._function_calls_in_progress[frame.tool_call_id] = frame
 
+        cancel_frame = self._function_calls_cancelled_early.pop(frame.tool_call_id, None)
+        if cancel_frame:
+            await self._settle_function_call_cancel(cancel_frame, frame)
+
     async def _handle_function_call_result(self, frame: FunctionCallResultFrame):
         logger.debug(
             f"{self} FunctionCallResultFrame: [{frame.function_name}:{frame.tool_call_id}]"
@@ -2388,10 +2395,29 @@ class LLMAssistantAggregator(LLMContextAggregator):
         logger.debug(
             f"{self} FunctionCallCancelFrame: [{frame.function_name}:{frame.tool_call_id}]"
         )
-        function_call = self._function_calls_in_progress.get(frame.tool_call_id)
-        if not function_call:
+        if frame.tool_call_id not in self._function_calls_in_progress:
             return
 
+        function_call = self._function_calls_in_progress[frame.tool_call_id]
+        if function_call is None:
+            # The cancel is a system frame, so it can overtake the call's
+            # in-progress frame while that frame is queued behind the reply's
+            # audio. The call stops counting as in progress now, and settles
+            # in the context once its in-progress frame arrives.
+            del self._function_calls_in_progress[frame.tool_call_id]
+            self._function_calls_cancelled_early[frame.tool_call_id] = frame
+            return
+
+        await self._settle_function_call_cancel(frame, function_call)
+
+    async def _settle_function_call_cancel(
+        self, frame: FunctionCallCancelFrame, function_call: FunctionCallInProgressFrame
+    ):
+        """Record a cancelled function call in the context and stop tracking it.
+
+        Runs inference afterwards if the cancellation asks for it and no
+        sibling call from the same LLM response is still running.
+        """
         # Update context with the function call cancellation. An async call is
         # settled with a developer message, the same channel its results use,
         # whether or not the conversation moved on, since the notice says the

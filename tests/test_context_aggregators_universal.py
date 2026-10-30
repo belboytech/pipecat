@@ -1710,6 +1710,76 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         assert context.messages[-1]["content"] == "CANCELLED"
         assert not aggregator.has_function_calls_in_progress
 
+    async def test_function_call_cancel_before_in_progress(self):
+        """A cancel that overtakes the call's in-progress frame still settles the call."""
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+        frames_to_send = [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="get_weather",
+                        tool_call_id="1",
+                        arguments={"location": "Los Angeles"},
+                        context=None,
+                    )
+                ]
+            ),
+            SleepFrame(),
+            FunctionCallCancelFrame(function_name="get_weather", tool_call_id="1"),
+            SleepFrame(),
+            FunctionCallInProgressFrame(
+                function_name="get_weather",
+                tool_call_id="1",
+                arguments={"location": "Los Angeles"},
+                cancel_on_interruption=True,
+            ),
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[],
+        )
+        assert context.messages[-2]["tool_calls"][0]["id"] == "1"
+        assert context.messages[-1]["tool_call_id"] == "1"
+        assert context.messages[-1]["content"] == "CANCELLED"
+        assert not aggregator.has_synchronous_function_calls_in_progress
+        assert not aggregator.has_function_calls_in_progress
+
+    async def test_function_call_cancel_run_llm_before_in_progress(self):
+        """A cancel asking for inference that overtakes the in-progress frame runs it once settled."""
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+        frames_to_send = [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="get_weather",
+                        tool_call_id="1",
+                        arguments={"location": "Los Angeles"},
+                        context=None,
+                    )
+                ]
+            ),
+            SleepFrame(),
+            FunctionCallCancelFrame(function_name="get_weather", tool_call_id="1", run_llm=True),
+            SleepFrame(),
+            FunctionCallInProgressFrame(
+                function_name="get_weather",
+                tool_call_id="1",
+                arguments={"location": "Los Angeles"},
+                cancel_on_interruption=True,
+            ),
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[],
+            expected_up_frames=[LLMContextFrame],
+        )
+        assert context.messages[-1]["content"] == "CANCELLED"
+        assert not aggregator.has_function_calls_in_progress
+
     async def test_fast_async_function_call_settles_in_place(self):
         """An async call whose result lands before anything else settles like a sync one."""
         context = LLMContext()
