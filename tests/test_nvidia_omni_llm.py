@@ -909,7 +909,9 @@ def _capture_requests(service: NvidiaOmniLLMService) -> dict:
 
     async def create(**kwargs):
         sent.update(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))], usage=None
+        )
 
     service._client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))
