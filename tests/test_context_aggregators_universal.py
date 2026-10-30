@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import unittest
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -18,6 +19,7 @@ from pipecat.frames.frames import (
     AggregatedTextFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ControlFrame,
     EndFrame,
     Frame,
     FunctionCallCancelFrame,
@@ -26,6 +28,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallResultProperties,
     FunctionCallsStartedFrame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -92,6 +95,7 @@ from pipecat.turns.user_mute import (
 )
 from pipecat.turns.user_start import (
     ExternalUserTurnStartStrategy,
+    MinWordsUserTurnStartStrategy,
     TranscriptionUserTurnStartStrategy,
     VADUserTurnStartStrategy,
 )
@@ -139,6 +143,19 @@ class EndAfterTurnStop(FrameProcessor):
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._turn_stopped.wait(), timeout=5.0)
         await self.push_frame(frame, direction)
+
+
+@dataclass
+class SlowFrame(ControlFrame):
+    """Holds the user aggregator busy so the frames sent after it queue up."""
+
+
+class SlowUserAggregator(LLMUserAggregator):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, SlowFrame):
+            await asyncio.sleep(0.3)
+            return
+        await super().process_frame(frame, direction)
 
 
 class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
@@ -711,6 +728,159 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         ]
         await run_test(
             Pipeline([TurnDetectingSTT(), user_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+
+    async def test_turn_opened_by_min_words_closes_on_the_stop_proposed_with_its_transcript(self):
+        """A service that proposes the stop together with the transcript closes the turn.
+
+        The transcript opens the turn, and the stop proposal is queued behind
+        it. The stop strategy's timers are set far longer than the test runs,
+        so the turn can only close on that proposal, before the session ends.
+        """
+
+        class TurnDetectingSTT(FrameProcessor):
+            """Stands in for an STT that reports the turn's end with its transcript."""
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, InputAudioRawFrame):
+                    await self.push_frame(
+                        TranscriptionFrame(
+                            text="Hello there!", user_id="", timestamp="now", finalized=True
+                        )
+                    )
+                    await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+                else:
+                    await self.push_frame(frame, direction)
+
+        user_aggregator = LLMUserAggregator(
+            LLMContext(),
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[MinWordsUserTurnStartStrategy(min_words=3)],
+                    stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
+                ),
+                user_turn_stop_timeout=30.0,
+            ),
+        )
+
+        frames_to_send = [
+            ProposedUserStartedSpeakingFrame(),
+            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            SleepFrame(sleep=0.3),
+            EndFrame(),
+        ]
+        received_down, _ = await run_test(
+            Pipeline([TurnDetectingSTT(), user_aggregator]),
+            frames_to_send=frames_to_send,
+            send_end_frame=False,
+        )
+        names = [type(f).__name__ for f in received_down]
+        self.assertIn("UserStoppedSpeakingFrame", names)
+        self.assertLess(names.index("UserStoppedSpeakingFrame"), names.index("EndFrame"))
+
+    async def test_turn_opened_by_a_transcript_closes_on_the_stop_proposed_behind_it(self):
+        """The interruption a transcript-opened turn fires keeps the stop queued behind it.
+
+        The stop strategy's timer is set far longer than the test runs, so the
+        turn can only close on the proposal.
+        """
+        context = LLMContext()
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[TranscriptionUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
+                ),
+                user_turn_stop_timeout=30.0,
+            ),
+        )
+
+        frames_to_send = [
+            ProposedUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Ja.", user_id="", timestamp="now", finalized=True),
+            ProposedUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ]
+        expected_down_frames = [
+            ProposedUserStartedSpeakingFrame,
+            UserStartedSpeakingFrame,
+            InterruptionFrame,
+            LLMContextUserTurnFrame,
+            LLMContextFrame,
+            UserStoppedSpeakingFrame,
+        ]
+        await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual(
+            [m["content"] for m in context.get_messages() if m["role"] == "user"], ["Ja."]
+        )
+
+    async def test_transcripts_queued_behind_a_turn_opening_transcript_join_the_turn(self):
+        context = LLMContext()
+        user_aggregator = SlowUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[TranscriptionUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
+                ),
+                user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
+            ),
+        )
+
+        frames_to_send = [
+            SlowFrame(),
+            TranscriptionFrame(text="Ja.", user_id="", timestamp="now", finalized=True),
+            TranscriptionFrame(text="Tack.", user_id="", timestamp="now", finalized=True),
+            SleepFrame(sleep=0.8),
+        ]
+        expected_down_frames = [
+            UserStartedSpeakingFrame,
+            InterruptionFrame,
+            UserStoppedSpeakingFrame,
+            LLMContextUserTurnFrame,
+            LLMContextFrame,
+        ]
+        await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual(
+            [m["content"] for m in context.get_messages() if m["role"] == "user"],
+            ["Ja. Tack."],
+        )
+
+    async def test_stop_proposed_before_a_turn_does_not_close_it(self):
+        """A stop proposal still queued when a start proposal opens a turn is dropped."""
+        user_aggregator = SlowUserAggregator(
+            LLMContext(),
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[ExternalUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(wait_for_transcript=False)],
+                ),
+                user_turn_stop_timeout=30.0,
+            ),
+        )
+
+        frames_to_send = [
+            SlowFrame(),
+            ProposedUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.03),
+            ProposedUserStartedSpeakingFrame(),
+            SleepFrame(sleep=0.6),
+        ]
+        expected_down_frames = [UserStartedSpeakingFrame, InterruptionFrame]
+        await run_test(
+            Pipeline([user_aggregator]),
             frames_to_send=frames_to_send,
             expected_down_frames=expected_down_frames,
         )
