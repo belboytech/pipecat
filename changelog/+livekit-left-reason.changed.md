@@ -1,0 +1,1 @@
+- `LiveKitTransport`'s `on_participant_left` now passes LiveKit's reason for the participant leaving, in lower case, such as `user_rejected` for a SIP call the callee refused or `user_unavailable` for one nobody answered. It's `disconnected`, as before, when LiveKit gives no reason.

@@ -14,7 +14,7 @@ event handling for conversational AI applications.
 import asyncio
 import functools
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -178,6 +178,22 @@ class LiveKitParams(TransportParams):
     video_out_max_bitrate: int | None = None
 
 
+def _disconnect_reason(participant: rtc.RemoteParticipant) -> str:
+    """Why a participant left the room, as LiveKit tells it.
+
+    LiveKit's ``DisconnectReason`` in lower case, such as ``user_rejected`` for a SIP call
+    the callee refused or ``user_unavailable`` for one nobody answered, or ``disconnected``
+    when LiveKit gives no reason.
+    """
+    reason = participant.disconnect_reason
+    if not reason:
+        return "disconnected"
+    try:
+        return rtc.DisconnectReason.Name(reason).lower()
+    except ValueError:
+        return "disconnected"
+
+
 class LiveKitCallbacks(BaseModel):
     """Callback handlers for LiveKit events.
 
@@ -185,7 +201,10 @@ class LiveKitCallbacks(BaseModel):
         on_connected: Called when connected to the LiveKit room.
         on_disconnected: Called when disconnected from the LiveKit room.
         on_participant_connected: Called when a participant joins the room.
-        on_participant_disconnected: Called when a participant leaves the room.
+        on_participant_disconnected: Called with the participant and why it left the
+            room, as ``_disconnect_reason`` names it.
+        on_participant_updated: Called with the participant, all its attributes and the
+            ones that changed, when a participant's attributes change.
         on_audio_track_subscribed: Called when an audio track is subscribed.
         on_audio_track_unsubscribed: Called when an audio track is unsubscribed.
         on_data_received: Called when data is received. The sender is None for
@@ -202,7 +221,8 @@ class LiveKitCallbacks(BaseModel):
     on_disconnected: Callable[[], Awaitable[None]]
     on_before_disconnect: Callable[[], Awaitable[None]]
     on_participant_connected: Callable[[str], Awaitable[None]]
-    on_participant_disconnected: Callable[[str], Awaitable[None]]
+    on_participant_disconnected: Callable[[str, str], Awaitable[None]]
+    on_participant_updated: Callable[[str, Mapping[str, str], Mapping[str, str]], Awaitable[None]]
     on_audio_track_subscribed: Callable[[str], Awaitable[None]]
     on_audio_track_unsubscribed: Callable[[str], Awaitable[None]]
     on_video_track_subscribed: Callable[[str], Awaitable[None]]
@@ -311,6 +331,9 @@ class LiveKitTransportClient:
         # Set up room event handlers
         self.room.on("participant_connected")(self._on_participant_connected_wrapper)
         self.room.on("participant_disconnected")(self._on_participant_disconnected_wrapper)
+        self.room.on("participant_attributes_changed")(
+            self._on_participant_attributes_changed_wrapper
+        )
         self.room.on("track_subscribed")(self._on_track_subscribed_wrapper)
         self.room.on("track_unsubscribed")(self._on_track_unsubscribed_wrapper)
         self.room.on("track_muted")(self._on_track_muted_wrapper)
@@ -628,6 +651,22 @@ class LiveKitTransportClient:
             f"{self}::_async_on_participant_disconnected",
         )
 
+    def _on_participant_attributes_changed_wrapper(
+        self, changed_attributes: dict[str, str], participant: rtc.Participant
+    ):
+        """Wrapper for participant attributes changed events.
+
+        LiveKit reports the bot's own changes too, which aren't another participant's.
+        """
+        assert self._task_manager is not None
+
+        if not isinstance(participant, rtc.RemoteParticipant):
+            return
+        self._task_manager.create_task(
+            self._async_on_participant_updated(participant, changed_attributes),
+            f"{self}::_async_on_participant_updated",
+        )
+
     def _on_track_subscribed_wrapper(
         self,
         track: rtc.Track,
@@ -745,10 +784,19 @@ class LiveKitTransportClient:
 
     async def _async_on_participant_disconnected(self, participant: rtc.RemoteParticipant):
         """Handle participant disconnected events."""
-        logger.info(f"Participant disconnected: {participant.identity}")
-        await self._callbacks.on_participant_disconnected(participant.identity)
+        reason = _disconnect_reason(participant)
+        logger.info(f"Participant disconnected: {participant.identity} ({reason})")
+        await self._callbacks.on_participant_disconnected(participant.identity, reason)
         if len(self.get_participants()) == 0:
             self._other_participant_has_joined = False
+
+    async def _async_on_participant_updated(
+        self, participant: rtc.RemoteParticipant, changed_attributes: Mapping[str, str]
+    ):
+        """Handle participant attributes changed events."""
+        await self._callbacks.on_participant_updated(
+            participant.identity, dict(participant.attributes), dict(changed_attributes)
+        )
 
     async def _async_on_track_subscribed(
         self,
@@ -1598,7 +1646,15 @@ class LiveKitTransport(BaseTransport):
     - on_participant_disconnected: Called when a participant disconnects.
       Args: (participant_id: str)
     - on_participant_left: Called when a participant leaves.
-      Args: (participant_id: str, reason: str)
+      Args: (participant_id: str, reason: str) where ``reason`` is LiveKit's
+      ``DisconnectReason`` in lower case, such as ``user_rejected`` for a SIP call the
+      callee refused or ``user_unavailable`` for one nobody answered, or
+      ``disconnected`` when LiveKit gives none.
+    - on_participant_updated: Called when a participant's attributes change, as on
+      Daily. On a SIP call, ``sip.callStatus`` among them says when the call is
+      ringing and when it's answered.
+      Args: (participant: dict) with keys ``id``, ``attributes`` (all of them) and
+      ``changed_attributes``.
     - on_client_connected: Called when a participant connects (alias for
       on_participant_connected). Args: (participant: dict)
     - on_client_disconnected: Called when a participant disconnects (alias for
@@ -1662,6 +1718,7 @@ class LiveKitTransport(BaseTransport):
             on_before_disconnect=self._on_before_disconnect,
             on_participant_connected=self._on_participant_connected,
             on_participant_disconnected=self._on_participant_disconnected,
+            on_participant_updated=self._on_participant_updated,
             on_audio_track_subscribed=self._on_audio_track_subscribed,
             on_audio_track_unsubscribed=self._on_audio_track_unsubscribed,
             on_video_track_subscribed=self._on_video_track_subscribed,
@@ -1684,6 +1741,7 @@ class LiveKitTransport(BaseTransport):
         self._register_event_handler("on_disconnected")
         self._register_event_handler("on_participant_connected")
         self._register_event_handler("on_participant_disconnected")
+        self._register_event_handler("on_participant_updated")
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
         self._register_event_handler("on_audio_track_subscribed")
@@ -1850,12 +1908,12 @@ class LiveKitTransport(BaseTransport):
         if self._input:
             await self._input.push_frame(ClientConnectedFrame())
 
-    async def _on_participant_disconnected(self, participant_id: str):
+    async def _on_participant_disconnected(self, participant_id: str, reason: str):
         """Handle participant disconnected events."""
         if self._input:
             await self._input.remove_participant_video(participant_id)
         await self._call_event_handler("on_participant_disconnected", participant_id)
-        await self._call_event_handler("on_participant_left", participant_id, "disconnected")
+        await self._call_event_handler("on_participant_left", participant_id, reason)
         # Also call on_client_disconnected for compatibility with other transports
         await self._call_event_handler("on_client_disconnected", {"id": participant_id})
 
@@ -1902,6 +1960,25 @@ class LiveKitTransport(BaseTransport):
             await self._call_event_handler("on_app_message", message, participant_id)
         # Backwards compatibility with older transports that used on_data_received for app messages
         await self._call_event_handler("on_data_received", data, participant_id)
+
+    async def _on_participant_updated(
+        self,
+        participant_id: str,
+        attributes: Mapping[str, str],
+        changed_attributes: Mapping[str, str],
+    ):
+        """Handle participant attributes changed events.
+
+        Wrapped as a dict, as Daily's event and LiveKit's on_client_connected are.
+        """
+        await self._call_event_handler(
+            "on_participant_updated",
+            {
+                "id": participant_id,
+                "attributes": attributes,
+                "changed_attributes": changed_attributes,
+            },
+        )
 
     async def _on_active_speaker_changed(self, participant_id: str):
         """Handle a change of the room's loudest speaker.

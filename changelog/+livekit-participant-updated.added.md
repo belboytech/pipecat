@@ -1,0 +1,1 @@
+- Added an `on_participant_updated` event to `LiveKitTransport`, as on `DailyTransport`. It fires when a participant's attributes change, with the participant's `id`, all its `attributes` and the `changed_attributes`. On a SIP call, `sip.callStatus` among them says when the call is ringing and when it's answered.

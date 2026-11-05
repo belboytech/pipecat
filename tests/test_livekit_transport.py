@@ -67,6 +67,7 @@ class TestLiveKitVideoStreamMemoryLeak(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
@@ -174,6 +175,7 @@ class TestLiveKitAudioStreamLeakOnUnsubscribe(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
@@ -383,6 +385,7 @@ class TestLiveKitSipDtmfInput(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
@@ -556,6 +559,130 @@ class TestLiveKitActiveSpeaker(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(LIVEKIT_AVAILABLE, "livekit package not installed")
+class TestLiveKitParticipantUpdated(unittest.IsolatedAsyncioTestCase):
+    """A participant's attribute changes surface as on_participant_updated, as on Daily. On a
+    SIP call that's how its answer shows: ``sip.callStatus`` turns ``active``.
+    """
+
+    def _client(self):
+        client = TestLiveKitSipDtmfInput._create_client(self)
+        client._callbacks.on_participant_updated = AsyncMock()
+        return client
+
+    async def _run_scheduled(self, client):
+        for call in client._task_manager.create_task.call_args_list:
+            await call.args[0]
+
+    def _sip_participant(self, attributes):
+        participant = MagicMock(spec=rtc.RemoteParticipant)
+        participant.identity = "sip-callee"
+        participant.attributes = attributes
+        return participant
+
+    async def test_setup_listens_for_the_room_event(self):
+        client = TestLiveKitSipDtmfInput._create_client(self)
+        client._task_manager = None
+        setup = MagicMock(audio_out_sample_rate=16000)
+
+        with patch("pipecat.transports.livekit.transport.rtc.Room") as room_class:
+            await client.setup(setup)
+
+        on = room_class.return_value.on  # room.on(event)(handler)
+        i = [c.args[0] for c in on.call_args_list].index("participant_attributes_changed")
+        self.assertEqual(
+            on.return_value.call_args_list[i].args[0],
+            client._on_participant_attributes_changed_wrapper,
+        )
+
+    async def test_a_participants_attributes_and_their_change_are_reported(self):
+        client = self._client()
+        participant = self._sip_participant(
+            {"sip.callStatus": "active", "sip.phoneNumber": "+15550100"}
+        )
+
+        client._on_participant_attributes_changed_wrapper({"sip.callStatus": "active"}, participant)
+        await self._run_scheduled(client)
+
+        client._callbacks.on_participant_updated.assert_awaited_once_with(
+            "sip-callee",
+            {"sip.callStatus": "active", "sip.phoneNumber": "+15550100"},
+            {"sip.callStatus": "active"},
+        )
+
+    async def test_the_bots_own_changes_arent_reported(self):
+        client = self._client()
+
+        client._on_participant_attributes_changed_wrapper(
+            {"state": "speaking"}, MagicMock(spec=rtc.LocalParticipant)
+        )
+
+        client._task_manager.create_task.assert_not_called()
+
+    async def test_transport_emits_dailys_event(self):
+        transport = LiveKitTransport(
+            url="wss://test.livekit.cloud", token="test-token", room_name="test-room"
+        )
+        transport._call_event_handler = AsyncMock()
+
+        await transport._on_participant_updated(
+            "sip-callee", {"sip.callStatus": "ringing"}, {"sip.callStatus": "ringing"}
+        )
+
+        transport._call_event_handler.assert_awaited_once_with(
+            "on_participant_updated",
+            {
+                "id": "sip-callee",
+                "attributes": {"sip.callStatus": "ringing"},
+                "changed_attributes": {"sip.callStatus": "ringing"},
+            },
+        )
+
+
+@unittest.skipUnless(LIVEKIT_AVAILABLE, "livekit package not installed")
+class TestLiveKitParticipantLeftReason(unittest.IsolatedAsyncioTestCase):
+    """on_participant_left says why the participant left, as LiveKit tells it: on a SIP call,
+    whether the callee refused it or nobody answered.
+    """
+
+    async def _left(self, disconnect_reason):
+        client = TestLiveKitSipDtmfInput._create_client(self)
+        client.get_participants = MagicMock(return_value=[])
+        participant = MagicMock(spec=rtc.RemoteParticipant)
+        participant.identity = "sip-callee"
+        participant.disconnect_reason = disconnect_reason
+
+        await client._async_on_participant_disconnected(participant)
+
+        client._callbacks.on_participant_disconnected.assert_awaited_once()
+        return client._callbacks.on_participant_disconnected.await_args.args
+
+    async def test_the_reason_is_livekits_in_lower_case(self):
+        refused = await self._left(rtc.DisconnectReason.USER_REJECTED)
+        unanswered = await self._left(rtc.DisconnectReason.USER_UNAVAILABLE)
+
+        self.assertEqual(refused, ("sip-callee", "user_rejected"))
+        self.assertEqual(unanswered, ("sip-callee", "user_unavailable"))
+
+    async def test_no_reason_is_disconnected_as_before(self):
+        self.assertEqual(
+            await self._left(rtc.DisconnectReason.UNKNOWN_REASON), ("sip-callee", "disconnected")
+        )
+
+    async def test_transport_passes_the_reason_on(self):
+        transport = LiveKitTransport(
+            url="wss://test.livekit.cloud", token="test-token", room_name="test-room"
+        )
+        transport._call_event_handler = AsyncMock()
+
+        await transport._on_participant_disconnected("sip-callee", "user_rejected")
+
+        transport._call_event_handler.assert_any_call(
+            "on_participant_left", "sip-callee", "user_rejected"
+        )
+        transport._call_event_handler.assert_any_call("on_participant_disconnected", "sip-callee")
+
+
+@unittest.skipUnless(LIVEKIT_AVAILABLE, "livekit package not installed")
 class TestLiveKitAppMessageInput(unittest.IsolatedAsyncioTestCase):
     """Inbound JSON data messages (RTVI's wire channel) are parsed and
     broadcast both directions as an ``InputTransportMessageFrame`` so
@@ -665,7 +792,7 @@ class TestLiveKitClientConnectedAlias(unittest.IsolatedAsyncioTestCase):
     async def test_on_client_disconnected_receives_dict(self):
         transport = self._make_transport()
 
-        await transport._on_participant_disconnected("participant-1")
+        await transport._on_participant_disconnected("participant-1", "client_initiated")
 
         transport._call_event_handler.assert_any_call(
             "on_client_disconnected", {"id": "participant-1"}
@@ -694,6 +821,7 @@ class TestLiveKitParticipantIdentity(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
@@ -852,6 +980,7 @@ class TestLiveKitVideoOutputPublish(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
@@ -1428,7 +1557,7 @@ class TestLiveKitInputVideoSampling(unittest.IsolatedAsyncioTestCase):
         )
         await transport.input().capture_participant_video("alice", 1, "camera")
 
-        await transport._on_participant_disconnected("alice")
+        await transport._on_participant_disconnected("alice", "client_initiated")
 
         self.assertFalse(transport.input()._video_samplers.is_capturing("alice", "camera"))
 
@@ -1514,6 +1643,7 @@ class TestLiveKitAudioOutQueueSize(unittest.IsolatedAsyncioTestCase):
             on_before_disconnect=AsyncMock(),
             on_participant_connected=AsyncMock(),
             on_participant_disconnected=AsyncMock(),
+            on_participant_updated=AsyncMock(),
             on_audio_track_subscribed=AsyncMock(),
             on_audio_track_unsubscribed=AsyncMock(),
             on_video_track_subscribed=AsyncMock(),
