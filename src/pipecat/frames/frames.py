@@ -250,7 +250,15 @@ class OutputAudioRawFrame(DataFrame, AudioRawFrame):
     A chunk of raw audio that will be played by the output transport. If the
     transport supports multiple audio destinations (e.g. multiple audio tracks)
     the destination name can be specified in transport_destination.
+
+    Parameters:
+        audio_before_mixing: The audio as it was before the output transport's
+            mixer mixed into it, set by the transport once it has. A frame the
+            mixer made on its own, while there was nothing else to play, holds
+            silence here. None when no mixer ran, so `audio` is all there is.
     """
+
+    audio_before_mixing: bytes | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         super().__post_init__()

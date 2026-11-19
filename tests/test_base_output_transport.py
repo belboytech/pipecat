@@ -946,3 +946,87 @@ class TestBaseOutputTransportVolume(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._written(transport), [32767])
         finally:
             await transport.cancel(CancelFrame())
+
+
+class _AddingMixer(BaseAudioMixer):
+    """Mixer that adds one to every sample, so mixed audio is told apart from what came in."""
+
+    async def start(self, sample_rate: int):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def process_frame(self, frame: MixerControlFrame):
+        pass
+
+    async def mix(self, audio: bytes) -> bytes:
+        return (np.frombuffer(audio, dtype=np.int16) + 1).astype(np.int16).tobytes()
+
+
+class TestBaseOutputTransportAudioBeforeMixing(unittest.IsolatedAsyncioTestCase):
+    """A frame pushed on from the output keeps the audio it had before the mixer ran."""
+
+    @staticmethod
+    def _pushed_audio(transport) -> list[OutputAudioRawFrame]:
+        return [
+            call.args[0]
+            for call in transport.push_frame.call_args_list
+            if isinstance(call.args[0], OutputAudioRawFrame)
+        ]
+
+    async def test_mixed_frame_keeps_its_audio_before_mixing(self):
+        transport = await _make_transport(mixer=_AddingMixer())
+        try:
+            sender = transport._media_senders[None]
+            speech = b"\x10\x00" * (sender.audio_chunk_size // 2)
+            await transport.process_frame(
+                TTSAudioRawFrame(audio=speech, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            for _ in range(100):
+                spoken = [
+                    f for f in self._pushed_audio(transport) if isinstance(f, TTSAudioRawFrame)
+                ]
+                if spoken:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(spoken), 1)
+            self.assertEqual(spoken[0].audio_before_mixing, speech)
+            self.assertEqual(spoken[0].audio, b"\x11\x00" * (sender.audio_chunk_size // 2))
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_mixer_only_frame_holds_silence_before_mixing(self):
+        transport = await _make_transport(mixer=_AddingMixer())
+        try:
+            sender = transport._media_senders[None]
+            await asyncio.sleep(0.1)
+            mixed_alone = self._pushed_audio(transport)
+            self.assertTrue(mixed_alone)
+            silence = b"\x00" * sender.audio_chunk_size
+            for frame in mixed_alone:
+                self.assertEqual(frame.audio_before_mixing, silence)
+                self.assertEqual(frame.audio, b"\x01\x00" * (sender.audio_chunk_size // 2))
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def test_without_a_mixer_nothing_is_kept(self):
+        transport = await _make_transport(mixer=None)
+        try:
+            sender = transport._media_senders[None]
+            speech = b"\x10\x00" * (sender.audio_chunk_size // 2)
+            await transport.process_frame(
+                TTSAudioRawFrame(audio=speech, sample_rate=sender.sample_rate, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            for _ in range(100):
+                pushed = self._pushed_audio(transport)
+                if pushed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(pushed), 1)
+            self.assertIsNone(pushed[0].audio_before_mixing)
+            self.assertEqual(pushed[0].audio, speech)
+        finally:
+            await transport.cancel(CancelFrame())

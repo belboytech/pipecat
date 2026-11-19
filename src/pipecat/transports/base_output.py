@@ -990,6 +990,7 @@ class BaseOutputTransport(FrameProcessor):
                         await self._filter_audio(frame)
                         self._apply_volume(frame)
                         if isinstance(frame, OutputAudioRawFrame):
+                            frame.audio_before_mixing = frame.audio
                             frame.audio = await mixer.mix(frame.audio)
                             last_frame_time = time.time()
                         yield frame
@@ -1005,6 +1006,7 @@ class BaseOutputTransport(FrameProcessor):
                             sample_rate=self._sample_rate,
                             num_channels=self._params.audio_out_channels,
                         )
+                        frame.audio_before_mixing = silence
                         yield frame
                         # Allow other asyncio tasks to execute by adding a small sleep
                         # Without this sleep, in task cancellation scenarios, this loop would
